@@ -100,6 +100,7 @@ enum tone_mapping {
     TONE_MAPPING_ST2094_40,
     TONE_MAPPING_ST2094_10,
     TONE_MAPPING_DOVI, // LOCAL PATCH
+    TONE_MAPPING_DOVI_REF, // LOCAL PATCH
 };
 
 enum gamut_mode {

@@ -879,33 +879,33 @@ local function append_dovi(s, p)
         return v < 1 and format("%.4g", v) or format("%.0f", v)
     end
 
+    -- Two lines: the levels, then the trims and the rest.
     append(s, "", {prefix="Dolby Vision:"})
     append(s, "v" .. p["dovi-cm"], {prefix="CM:", nl="", indent=""})
     append(s, format("%s / %s", nits(p["dovi-source-min"]), nits(p["dovi-source-max"])),
            {prefix="Source:", suffix=" cd/m²", nl="", indent=indent})
-    if p["dovi-l9-source"] then
-        append(s, p["dovi-l9-source"], {prefix="Primaries (L9):", nl="", indent=indent})
-    end
     if p["dovi-l1-max"] then
         append(s, format("%s / %s / %s", nits(p["dovi-l1-min"]), nits(p["dovi-l1-avg"]),
                          nits(p["dovi-l1-max"])),
-               {prefix="Scene min/avg/max (L1):", suffix=" cd/m²"})
+               {prefix="L1:", suffix=" cd/m²", nl="", indent=indent})
     end
     if p["dovi-l3-offsets"] then
-        append(s, p["dovi-l3-offsets"], {prefix="L1 offsets (L3):", nl="", indent=indent})
+        append(s, p["dovi-l3-offsets"], {prefix="L3:", nl="", indent=indent})
     end
-    if p["dovi-l2-targets"] then
-        append(s, p["dovi-l2-targets"], {prefix="Trims (L2):", suffix=" cd/m²"})
+
+    local first = true
+    local function more(value, prefix, suffix)
+        if value then
+            append(s, value, {prefix=prefix, suffix=suffix, nl=first and o.nl or "",
+                              indent=first and o.indent or indent})
+            first = false
+        end
     end
-    if p["dovi-l8-targets"] then
-        append(s, p["dovi-l8-targets"], {prefix="Trims (L8), targets:", nl="", indent=indent})
-    end
-    if p["dovi-l10-targets"] then
-        append(s, p["dovi-l10-targets"], {prefix="Targets (L10):"})
-    end
-    if p["dovi-l5-area"] then
-        append(s, p["dovi-l5-area"], {prefix="Active area offsets (L5) L/R/T/B:"})
-    end
+    more(p["dovi-l2-targets"], "L2:", " cd/m²")
+    more(p["dovi-l8-targets"], "L8:")
+    more(p["dovi-l9-source"], "L9:")
+    more(p["dovi-l10-targets"], "L10:")
+    more(p["dovi-l5-area"], "L5:")
 end
 
 
@@ -1114,6 +1114,10 @@ local function add_video(s)
         append_fps(s, "container-fps", "estimated-vf-fps")
     end
     append_img_params(s, r, ro)
+    -- PQ(Y) is Dolby Vision's L1 max/avg (libplacebo sets it from L1): shown with L1 instead
+    if ro and ro["dovi-l1-max"] then
+        ro["max-pq-y"], ro["avg-pq-y"] = nil, nil
+    end
     append_hdr(s, ro)
     append_dovi(s, ro or r)
     append_property(s, "video-bitrate", {prefix="Bitrate:"})

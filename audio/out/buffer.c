@@ -23,6 +23,8 @@
 
 #include "ao.h"
 #include "internal.h"
+#include <libavutil/frame.h>
+
 #include "audio/aframe.h"
 #include "audio/format.h"
 
@@ -55,6 +57,11 @@ struct buffer_state {
     struct mp_filter *filter_root;
     struct mp_filter *input;    // connected to queue
     struct mp_aframe *pending;  // last, not fully consumed output
+
+    // The Atmos objects (AV_FRAME_DATA_ATMOS_OBJECTS) of the frame the last read started in,
+    // for ao_get_atmos_objects().
+    uint8_t atmos_objects[1024];
+    size_t atmos_objects_size;
 
     bool streaming;             // AO streaming active
     bool playing;               // logically playing audio from buffer
@@ -121,6 +128,7 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
 {
     struct buffer_state *p = ao->buffer_state;
     int pos = 0;
+    bool atmos_read = !data;
     *eof = false;
 
     while (p->playing && !p->paused && pos < samples) {
@@ -140,6 +148,18 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
 
         if (!data)
             break;
+
+#ifdef AV_FRAME_DATA_ATMOS_OBJECTS_AVAILABLE
+        if (!atmos_read) {
+            // the frame this read's first sample comes from: the objects the driver sends for it
+            struct AVFrameSideData *sd =
+                mp_aframe_get_side_data(p->pending, AV_FRAME_DATA_ATMOS_OBJECTS);
+            p->atmos_objects_size = sd ? MPMIN(sd->size, sizeof(p->atmos_objects)) : 0;
+            if (sd)
+                memcpy(p->atmos_objects, sd->data, p->atmos_objects_size);
+            atmos_read = true;
+        }
+#endif
 
         int copy = mp_aframe_get_size(p->pending);
         uint8_t **fdata = mp_aframe_get_data_ro(p->pending);
@@ -225,6 +245,19 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, b
     mp_mutex_unlock(&p->lock);
 
     return pos;
+}
+
+// The Atmos objects (an array of AVAtmosObject, one per channel) of the frame the last
+// ao_read_data() call started in: copied to dst, returning their size in bytes, or 0 if that
+// frame had none. Call it from the thread that called ao_read_data().
+size_t ao_get_atmos_objects(struct ao *ao, void *dst, size_t size)
+{
+    struct buffer_state *p = ao->buffer_state;
+    mp_mutex_lock(&p->lock);
+    size_t n = MPMIN(size, p->atmos_objects_size);
+    memcpy(dst, p->atmos_objects, n);
+    mp_mutex_unlock(&p->lock);
+    return n;
 }
 
 // Same as ao_read_data(), but convert data according to *fmt.

@@ -984,6 +984,7 @@ features += {'wasapi': wasapi}
 if features['wasapi']
     sources += files('audio/out/ao_wasapi.c',
                      'audio/out/ao_wasapi_changenotify.c',
+                     'audio/out/ao_wasapi_spatial.c',
                      'audio/out/ao_wasapi_utils.c')
 endif
 

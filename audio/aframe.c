@@ -153,6 +153,11 @@ struct mp_aframe *mp_aframe_from_avframe(struct AVFrame *av_frame)
     return frame;
 }
 
+struct AVFrameSideData *mp_aframe_get_side_data(struct mp_aframe *frame, int type)
+{
+    return av_frame_get_side_data(frame->av_frame, type);
+}
+
 // Return a new reference to the data in frame. Returns NULL is not
 // representable (), or if input is NULL.
 // Does not copy the timestamps.

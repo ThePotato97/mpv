@@ -16,6 +16,8 @@ void mp_aframe_reset(struct mp_aframe *frame);
 void mp_aframe_unref_data(struct mp_aframe *frame);
 
 struct AVFrame *mp_aframe_to_avframe(struct mp_aframe *frame);
+// The frame's AVFrame side data of `type` (an enum AVFrameSideDataType), or NULL.
+struct AVFrameSideData *mp_aframe_get_side_data(struct mp_aframe *frame, int type);
 struct AVFrame *mp_aframe_to_avframe_and_unref(struct mp_aframe *frame);
 struct AVFrame *mp_aframe_get_raw_avframe(struct mp_aframe *frame);
 

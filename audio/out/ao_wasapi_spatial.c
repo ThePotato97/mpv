@@ -1,0 +1,385 @@
+/*
+ * This file is part of mpv.
+ *
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * mpv is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Dolby Atmos objects to Windows' spatial audio (ISpatialAudioObjectRenderStream), so the
+ * spatial sound provider (Dolby Atmos for Headphones, Windows Sonic) renders them as it renders
+ * those of Windows' own DD+ decoder.
+ *
+ * It plays only what FFmpeg's libatmos decoders give: ATMOS_CHANNELS unnamed float channels at
+ * 48 kHz with AV_FRAME_DATA_ATMOS_OBJECTS, one AVAtmosObject per channel. Anything else fails
+ * init, so the next audio output in the list plays it. A static channel goes out as its
+ * AudioObjectType; a dynamic one as a dynamic object, activated in channel order (the stream's
+ * OAMD order, as Windows' decoder activates them), at its position, with its volume left at 1:
+ * the samples already carry each object's gain, and the provider applies its own headroom, clip
+ * and position smoothing. Objects are released on every reset (a seek), as Windows' decoder path
+ * releases them.
+ */
+
+#include <math.h>
+
+#define COBJMACROS 1
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <spatialaudioclient.h>
+
+#include <libavutil/frame.h>
+
+#include "audio/format.h"
+#include "common/msg.h"
+#include "osdep/threads.h"
+#include "osdep/timer.h"
+#include "ao.h"
+#include "internal.h"
+
+#ifdef AV_FRAME_DATA_ATMOS_OBJECTS_AVAILABLE
+#include <libavutil/atmos_objects.h>
+#endif
+
+#define ATMOS_CHANNELS 32
+#define ATMOS_RATE 48000
+/* FrontLeft .. TopBackRight, LowFrequency included: the bed's static types */
+#define STATIC_MASK 0x1FFE
+/* Dolby Atmos' 32 active objects: a 7.1.4 bed and 20 dynamic */
+#define MAX_DYNAMIC 20
+
+/* Defined in ao_wasapi_utils.c. */
+extern const GUID CLSID_MMDeviceEnumerator;
+extern const GUID IID_IMMDeviceEnumerator;
+
+static const GUID spatial_IID_ISpatialAudioClient =
+    {0xbbf8e066, 0xaaaa, 0x49be, {0x9a, 0x4d, 0xfd, 0x2a, 0x85, 0x8e, 0xa2, 0x7f}};
+static const GUID spatial_IID_ISpatialAudioObjectRenderStream =
+    {0xbab5f473, 0xb423, 0x477b, {0x85, 0xf5, 0xb5, 0xa3, 0x32, 0xa0, 0x41, 0x53}};
+
+#ifndef AV_FRAME_DATA_ATMOS_OBJECTS_AVAILABLE
+typedef struct AVAtmosObject {
+    uint32_t object_type;
+    float x, y, z;
+    uint32_t active;
+} AVAtmosObject;
+#endif
+
+struct priv {
+    mp_thread thread;
+    HANDLE event;           // the stream's buffer-ready event
+    HANDLE wake;            // our requests to the thread
+    HANDLE init_done;
+    bool init_ok;
+    atomic_int request;     // REQ_*
+    ISpatialAudioClient *client;
+    ISpatialAudioObjectRenderStream *stream;
+    ISpatialAudioObject *objects[ATMOS_CHANNELS];
+    uint32_t types[ATMOS_CHANNELS];
+    AVAtmosObject meta[ATMOS_CHANNELS];
+    float *planes[ATMOS_CHANNELS];
+    UINT32 planes_frames;
+    UINT32 max_dynamic;
+    bool started;
+    bool running;           // the thread is up
+};
+
+enum { REQ_NONE, REQ_START, REQ_PAUSE, REQ_RESET, REQ_QUIT };
+
+static void release_objects(struct priv *p)
+{
+    for (int c = 0; c < ATMOS_CHANNELS; c++) {
+        if (p->objects[c]) {
+            ISpatialAudioObject_Release(p->objects[c]);
+            p->objects[c] = NULL;
+        }
+        p->types[c] = 0;
+    }
+}
+
+static bool open_stream(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    IMMDeviceEnumerator *enumerator = NULL;
+    IMMDevice *device = NULL;
+    HRESULT hr;
+
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &IID_IMMDeviceEnumerator, (void **)&enumerator);
+    if (FAILED(hr))
+        goto fail;
+    hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eRender, eMultimedia, &device);
+    if (FAILED(hr))
+        goto fail;
+    hr = IMMDevice_Activate(device, &spatial_IID_ISpatialAudioClient, CLSCTX_INPROC_SERVER,
+                            NULL, (void **)&p->client);
+    if (FAILED(hr)) {
+        MP_VERBOSE(ao, "No spatial audio on this device (0x%lx)\n", (unsigned long)hr);
+        goto fail;
+    }
+
+    WAVEFORMATEX format = {
+        .wFormatTag = WAVE_FORMAT_IEEE_FLOAT,
+        .nChannels = 1,
+        .nSamplesPerSec = ATMOS_RATE,
+        .wBitsPerSample = 32,
+        .nBlockAlign = 4,
+        .nAvgBytesPerSec = ATMOS_RATE * 4,
+    };
+    hr = ISpatialAudioClient_IsAudioObjectFormatSupported(p->client, &format);
+    if (FAILED(hr)) {
+        MP_VERBOSE(ao, "48 kHz float objects not supported (0x%lx)\n", (unsigned long)hr);
+        goto fail;
+    }
+    hr = ISpatialAudioClient_GetMaxDynamicObjectCount(p->client, &p->max_dynamic);
+    if (FAILED(hr) || !p->max_dynamic) {
+        // spatial sound off, or a provider without dynamic objects
+        MP_VERBOSE(ao, "No dynamic spatial audio objects available\n");
+        goto fail;
+    }
+    p->max_dynamic = MPMIN(p->max_dynamic, MAX_DYNAMIC);
+
+    SpatialAudioObjectRenderStreamActivationParams params = {
+        .ObjectFormat = &format,
+        .StaticObjectTypeMask = STATIC_MASK,
+        .MinDynamicObjectCount = 0,
+        .MaxDynamicObjectCount = p->max_dynamic,
+        .Category = AudioCategory_Movie,
+        .EventHandle = p->event,
+        .NotifyObject = NULL,
+    };
+    PROPVARIANT activation;
+    PropVariantInit(&activation);
+    activation.vt = VT_BLOB;
+    activation.blob.cbSize = sizeof(params);
+    activation.blob.pBlobData = (BYTE *)&params;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(p->client, &activation,
+            &spatial_IID_ISpatialAudioObjectRenderStream, (void **)&p->stream);
+    if (FAILED(hr)) {
+        MP_VERBOSE(ao, "Spatial audio stream refused (0x%lx)\n", (unsigned long)hr);
+        goto fail;
+    }
+    MP_VERBOSE(ao, "Spatial audio stream: %u dynamic objects\n", (unsigned)p->max_dynamic);
+
+    IMMDevice_Release(device);
+    IMMDeviceEnumerator_Release(enumerator);
+    return true;
+
+fail:
+    if (device)
+        IMMDevice_Release(device);
+    if (enumerator)
+        IMMDeviceEnumerator_Release(enumerator);
+    return false;
+}
+
+static void close_stream(struct priv *p)
+{
+    release_objects(p);
+    if (p->stream) {
+        ISpatialAudioObjectRenderStream_Stop(p->stream);
+        ISpatialAudioObjectRenderStream_Release(p->stream);
+        p->stream = NULL;
+    }
+    if (p->client) {
+        ISpatialAudioClient_Release(p->client);
+        p->client = NULL;
+    }
+}
+
+/* One pass: the provider asks for `frames` samples of every active object. */
+static void feed(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    UINT32 available = 0, frames = 0;
+
+    if (FAILED(ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(p->stream, &available, &frames)))
+        return;
+
+    if (frames > p->planes_frames) {
+        for (int c = 0; c < ATMOS_CHANNELS; c++)
+            p->planes[c] = talloc_realloc(ao, p->planes[c], float, frames);
+        p->planes_frames = frames;
+    }
+    // the last sample's delay to the ear: this buffer and the one being played
+    int64_t out_time = mp_time_ns() + MP_TIME_S_TO_NS(2.0 * frames / ATMOS_RATE);
+    ao_read_data(ao, (void **)p->planes, frames, out_time, NULL, true, true);
+    if (ao_get_atmos_objects(ao, p->meta, sizeof(p->meta)) != sizeof(p->meta))
+        memset(p->meta, 0, sizeof(p->meta)); // silence or a gap: every object idle
+
+    for (int c = 0; c < ATMOS_CHANNELS; c++) {
+        uint32_t type = p->meta[c].object_type;
+        if (p->objects[c] && type != p->types[c]) {
+            // its element changed (a new layout): the old object ends here
+            ISpatialAudioObject_SetEndOfStream(p->objects[c], 0);
+            ISpatialAudioObject_Release(p->objects[c]);
+            p->objects[c] = NULL;
+            p->types[c] = 0;
+        }
+        if (!type)
+            continue;
+        if (!p->objects[c]) {
+            if (type == AudioObjectType_Dynamic && !available)
+                continue; // the provider has no dynamic object left for it
+            if (FAILED(ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(
+                    p->stream, (AudioObjectType)type, &p->objects[c])))
+            {
+                p->objects[c] = NULL;
+                continue;
+            }
+            p->types[c] = type;
+            if (type == AudioObjectType_Dynamic)
+                available--;
+            ISpatialAudioObject_SetVolume(p->objects[c], 1.0f);
+        }
+        if (type == AudioObjectType_Dynamic)
+            ISpatialAudioObject_SetPosition(p->objects[c], p->meta[c].x, p->meta[c].y, p->meta[c].z);
+        BYTE *buffer = NULL;
+        UINT32 bytes = 0;
+        if (SUCCEEDED(ISpatialAudioObject_GetBuffer(p->objects[c], &buffer, &bytes)) && buffer)
+            memcpy(buffer, p->planes[c], MPMIN(bytes, frames * sizeof(float)));
+    }
+
+    ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(p->stream);
+}
+
+static MP_THREAD_VOID audio_thread(void *arg)
+{
+    struct ao *ao = arg;
+    struct priv *p = ao->priv;
+    mp_thread_set_name("ao/wasapi_spatial");
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    p->init_ok = open_stream(ao);
+    SetEvent(p->init_done);
+    if (!p->init_ok)
+        goto done;
+
+    while (true) {
+        HANDLE handles[] = {p->event, p->wake};
+        DWORD r = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+        if (r == WAIT_OBJECT_0) {
+            if (p->started)
+                feed(ao);
+            continue;
+        }
+        int request = atomic_exchange(&p->request, REQ_NONE);
+        if (request == REQ_QUIT)
+            break;
+        if (request == REQ_START && !p->started) {
+            if (SUCCEEDED(ISpatialAudioObjectRenderStream_Start(p->stream)))
+                p->started = true;
+        } else if (request == REQ_PAUSE && p->started) {
+            ISpatialAudioObjectRenderStream_Stop(p->stream);
+            p->started = false;
+        } else if (request == REQ_RESET) {
+            ISpatialAudioObjectRenderStream_Stop(p->stream);
+            ISpatialAudioObjectRenderStream_Reset(p->stream);
+            release_objects(p);
+            p->started = false;
+        }
+    }
+
+done:
+    close_stream(p);
+    CoUninitialize();
+    MP_THREAD_RETURN();
+}
+
+static void request(struct ao *ao, int req)
+{
+    struct priv *p = ao->priv;
+    atomic_store(&p->request, req);
+    SetEvent(p->wake);
+}
+
+static void close_handles(struct priv *p)
+{
+    if (p->event)
+        CloseHandle(p->event);
+    if (p->wake)
+        CloseHandle(p->wake);
+    if (p->init_done)
+        CloseHandle(p->init_done);
+    p->event = p->wake = p->init_done = NULL;
+}
+
+static void uninit(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (p->running) {
+        request(ao, REQ_QUIT);
+        mp_thread_join(p->thread);
+        p->running = false;
+    }
+    close_handles(p);
+}
+
+static int init(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+
+    if (ao->samplerate != ATMOS_RATE || ao->channels.num != ATMOS_CHANNELS ||
+        !mp_chmap_is_unknown(&ao->channels))
+    {
+        MP_VERBOSE(ao, "Not Atmos objects: another output plays this\n");
+        return -1;
+    }
+    ao->format = AF_FORMAT_FLOATP;
+
+    p->event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    p->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    p->init_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!p->event || !p->wake || !p->init_done)
+        goto fail;
+    if (mp_thread_create(&p->thread, audio_thread, ao))
+        goto fail;
+    WaitForSingleObject(p->init_done, INFINITE);
+    if (!p->init_ok) {
+        // the thread has closed what it opened and returned
+        mp_thread_join(p->thread);
+        goto fail;
+    }
+    p->running = true;
+    return 0;
+
+fail:
+    close_handles(p);
+    return -1;
+}
+
+static void start(struct ao *ao)
+{
+    request(ao, REQ_START);
+}
+
+static void reset(struct ao *ao)
+{
+    request(ao, REQ_RESET);
+}
+
+static bool set_pause(struct ao *ao, bool paused)
+{
+    request(ao, paused ? REQ_PAUSE : REQ_START);
+    return true;
+}
+
+const struct ao_driver audio_out_wasapi_spatial = {
+    .description = "Windows spatial audio objects (Dolby Atmos objects from libatmos)",
+    .name        = "wasapi_spatial",
+    .init        = init,
+    .uninit      = uninit,
+    .reset       = reset,
+    .start       = start,
+    .set_pause   = set_pause,
+    .priv_size   = sizeof(struct priv),
+};

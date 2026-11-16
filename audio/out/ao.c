@@ -51,6 +51,7 @@ extern const struct ao_driver audio_out_opensles;
 extern const struct ao_driver audio_out_null;
 extern const struct ao_driver audio_out_alsa;
 extern const struct ao_driver audio_out_wasapi;
+extern const struct ao_driver audio_out_wasapi_spatial;
 extern const struct ao_driver audio_out_pcm;
 extern const struct ao_driver audio_out_lavc;
 extern const struct ao_driver audio_out_sdl;
@@ -84,6 +85,8 @@ static const struct ao_driver * const audio_out_drivers[] = {
 #endif
 #if HAVE_WASAPI
     &audio_out_wasapi,
+    // after wasapi, which auto-probing takes first: only an explicit --ao picks this one
+    &audio_out_wasapi_spatial,
 #endif
 #if HAVE_OSS_AUDIO
     &audio_out_oss,

@@ -2571,6 +2571,32 @@ static int property_imgparams(const struct mp_image_params *p, int action, void 
     bool custom_prim   = pl_primaries_valid(&hdr->prim) &&
                          !pl_raw_primaries_similar(&hdr->prim, pl_raw_primaries_get(p->color.primaries));
 
+#ifdef PL_DOVI_DM_MAX_L2
+    // The frame's Dolby Vision display management metadata, from a libplacebo with the Dolby
+    // Vision DM (pl_dovi_dm: raw 12-bit PQ codes), in cd/m² where it's a level.
+    const struct pl_dovi_dm *dm = &hdr->dovi;
+#define DOVI_NITS(code) pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, (code) / 4095.0f)
+    char dovi_l2[128] = "", dovi_l3[48] = "", dovi_l5[48] = "", dovi_l8[48] = "", dovi_l10[128] = "";
+    for (int i = 0; i < dm->num_l2; i++)
+        mp_snprintf_cat(dovi_l2, sizeof(dovi_l2), "%s%.0f", i ? ", " : "",
+                        DOVI_NITS(dm->l2[i].target_max_pq));
+    if (dm->has_l3) {
+        // offsets to L1's min/avg/max, 2048 being none
+        snprintf(dovi_l3, sizeof(dovi_l3), "%+d / %+d / %+d", dm->l3_min - 2048,
+                 dm->l3_avg - 2048, dm->l3_max - 2048);
+    }
+    if (dm->has_l5) {
+        snprintf(dovi_l5, sizeof(dovi_l5), "%u / %u / %u / %u", dm->l5_left, dm->l5_right,
+                 dm->l5_top, dm->l5_bottom);
+    }
+    for (int i = 0; i < dm->num_l8; i++)
+        mp_snprintf_cat(dovi_l8, sizeof(dovi_l8), "%s%u", i ? ", " : "", dm->l8[i].target_index);
+    for (int i = 0; i < dm->num_l10; i++) {
+        mp_snprintf_cat(dovi_l10, sizeof(dovi_l10), "%s%u (%.0f cd/m²)", i ? ", " : "",
+                        dm->l10[i].target_index, DOVI_NITS(dm->l10[i].target_max_pq));
+    }
+#endif
+
     bool has_crop = mp_rect_w(p->crop) > 0 && mp_rect_h(p->crop) > 0;
     const char *aspect_name = get_aspect_ratio_name(d_w / (double)d_h);
     const char *sar_name = get_aspect_ratio_name(p->w / (double)p->h);
@@ -2633,8 +2659,27 @@ static int property_imgparams(const struct mp_image_params *p, int action, void 
         {"prim-blue-y",  SUB_PROP_FLOAT(hdr->prim.blue.y), .unavailable = !custom_prim },
         {"prim-white-x", SUB_PROP_FLOAT(hdr->prim.white.x),.unavailable = !custom_prim },
         {"prim-white-y", SUB_PROP_FLOAT(hdr->prim.white.y),.unavailable = !custom_prim },
+#ifdef PL_DOVI_DM_MAX_L2
+        // content mapping version: CM v4.0 streams carry L254
+        {"dovi-cm",         SUB_PROP_STR(dm->l254_version >= 0 ? "4.0" : "2.9"),
+                            .unavailable = !dm->present},
+        {"dovi-source-min", SUB_PROP_FLOAT(DOVI_NITS(dm->source_min_pq)), .unavailable = !dm->present},
+        {"dovi-source-max", SUB_PROP_FLOAT(DOVI_NITS(dm->source_max_pq)), .unavailable = !dm->present},
+        {"dovi-l1-min",     SUB_PROP_FLOAT(DOVI_NITS(dm->l1_min)), .unavailable = !dm->has_l1},
+        {"dovi-l1-avg",     SUB_PROP_FLOAT(DOVI_NITS(dm->l1_avg)), .unavailable = !dm->has_l1},
+        {"dovi-l1-max",     SUB_PROP_FLOAT(DOVI_NITS(dm->l1_max)), .unavailable = !dm->has_l1},
+        {"dovi-l2-targets", SUB_PROP_STR(dovi_l2),  .unavailable = !dm->num_l2},
+        {"dovi-l3-offsets", SUB_PROP_STR(dovi_l3),  .unavailable = !dm->has_l3},
+        {"dovi-l5-area",    SUB_PROP_STR(dovi_l5),  .unavailable = !dm->has_l5},
+        {"dovi-l8-targets", SUB_PROP_STR(dovi_l8),  .unavailable = !dm->num_l8},
+        {"dovi-l9-source",  SUB_PROP_INT(dm->l9_index), .unavailable = !dm->has_l9},
+        {"dovi-l10-targets", SUB_PROP_STR(dovi_l10), .unavailable = !dm->num_l10},
+#endif
         {0}
     };
+#ifdef PL_DOVI_DM_MAX_L2
+#undef DOVI_NITS
+#endif
 
     return m_property_read_sub(props, action, arg);
 }

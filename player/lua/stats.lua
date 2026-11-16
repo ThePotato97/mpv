@@ -868,6 +868,63 @@ local function append_hdr(s, hdr, video_out)
 end
 
 
+-- The frame's Dolby Vision display management metadata (video-params' dovi-* fields, from a
+-- libplacebo with the Dolby Vision DM).
+local function append_dovi(s, p)
+    if not p or not p["dovi-cm"] then
+        return
+    end
+    local indent = o.prefix_sep .. o.prefix_sep
+    local function nits(v)
+        return v < 1 and format("%.4g", v) or format("%.0f", v)
+    end
+
+    append(s, "", {prefix="Dolby Vision:"})
+    append(s, "v" .. p["dovi-cm"], {prefix="CM:", nl="", indent=""})
+    append(s, format("%s / %s", nits(p["dovi-source-min"]), nits(p["dovi-source-max"])),
+           {prefix="Source:", suffix=" cd/m²", nl="", indent=indent})
+    if p["dovi-l9-source"] then
+        append(s, p["dovi-l9-source"], {prefix="Primaries (L9):", nl="", indent=indent})
+    end
+    if p["dovi-l1-max"] then
+        append(s, format("%s / %s / %s", nits(p["dovi-l1-min"]), nits(p["dovi-l1-avg"]),
+                         nits(p["dovi-l1-max"])),
+               {prefix="Scene min/avg/max (L1):", suffix=" cd/m²"})
+    end
+    if p["dovi-l3-offsets"] then
+        append(s, p["dovi-l3-offsets"], {prefix="L1 offsets (L3):", nl="", indent=indent})
+    end
+    if p["dovi-l2-targets"] then
+        append(s, p["dovi-l2-targets"], {prefix="Trims (L2):", suffix=" cd/m²"})
+    end
+    if p["dovi-l8-targets"] then
+        append(s, p["dovi-l8-targets"], {prefix="Trims (L8), targets:", nl="", indent=indent})
+    end
+    if p["dovi-l10-targets"] then
+        append(s, p["dovi-l10-targets"], {prefix="Targets (L10):"})
+    end
+    if p["dovi-l5-area"] then
+        append(s, p["dovi-l5-area"], {prefix="Active area offsets (L5) L/R/T/B:"})
+    end
+end
+
+
+-- The tone mapping libplacebo uses: libplacebo-opts' tone_mapping overrides mpv's own
+-- --tone-mapping (gpu-next applies libplacebo-opts last).
+local function append_tone_mapping(s, source)
+    local gamma = source and source["gamma"]
+    if gamma ~= "pq" and gamma ~= "hlg" then
+        return
+    end
+    local opts = mp.get_property_native("libplacebo-opts") or {}
+    if opts["tone_mapping"] then
+        append(s, opts["tone_mapping"] .. " (libplacebo-opts)", {prefix="Tone mapping:"})
+    else
+        append_property(s, "tone-mapping", {prefix="Tone mapping:"})
+    end
+end
+
+
 local function append_img_params(s, r, ro)
     if not r then
         return
@@ -987,6 +1044,7 @@ local function add_video_out(s)
 
     append_img_params(s, r)
     append_hdr(s, r, true)
+    append_tone_mapping(s, mp.get_property_native("video-params"))
 end
 
 
@@ -1057,6 +1115,7 @@ local function add_video(s)
     end
     append_img_params(s, r, ro)
     append_hdr(s, ro)
+    append_dovi(s, ro or r)
     append_property(s, "video-bitrate", {prefix="Bitrate:"})
     append_filters(s, "vf", "Filters:")
 end

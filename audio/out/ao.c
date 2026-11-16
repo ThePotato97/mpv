@@ -345,7 +345,10 @@ struct ao *ao_init_best(struct mpv_global *global,
         bool probing = n + 1 != ao_num;
         mp_verbose(log, "Trying audio driver '%s'\n", entry->name);
         char *dev = NULL;
-        if (pref_ao && pref_dev && strcmp(entry->name, pref_ao) == 0) {
+        // wasapi_spatial opens wasapi's devices, so a wasapi device is its too
+        bool same_devices = pref_ao && strcmp(pref_ao, "wasapi") == 0 &&
+                            strcmp(entry->name, "wasapi_spatial") == 0;
+        if (pref_ao && pref_dev && (strcmp(entry->name, pref_ao) == 0 || same_devices)) {
             dev = pref_dev;
             mp_verbose(log, "Using preferred device '%s'\n", dev);
         }

@@ -60,6 +60,9 @@
 /* Defined in ao_wasapi_utils.c. */
 extern const GUID CLSID_MMDeviceEnumerator;
 extern const GUID IID_IMMDeviceEnumerator;
+extern const GUID IID_IAudioClock;
+/* ao_wasapi_utils.c: the device --audio-device names (wasapi's), or the default. */
+LPWSTR wasapi_find_deviceID(struct ao *ao);
 
 static const GUID spatial_IID_ISpatialAudioClient =
     {0xbbf8e066, 0xaaaa, 0x49be, {0x9a, 0x4d, 0xfd, 0x2a, 0x85, 0x8e, 0xa2, 0x7f}};
@@ -83,6 +86,9 @@ struct priv {
     atomic_int request;     // REQ_*
     ISpatialAudioClient *client;
     ISpatialAudioObjectRenderStream *stream;
+    IAudioClock *clock;     // the stream's clock (GetService), or NULL
+    UINT64 clock_frequency;
+    UINT64 written;         // frames handed to the stream since it last started from zero
     ISpatialAudioObject *objects[ATMOS_CHANNELS];
     uint32_t types[ATMOS_CHANNELS];
     AVAtmosObject meta[ATMOS_CHANNELS];
@@ -91,6 +97,7 @@ struct priv {
     UINT32 max_dynamic;
     bool started;
     bool running;           // the thread is up
+    bool reloading;         // the stream failed: mpv reopens the output
 };
 
 enum { REQ_NONE, REQ_START, REQ_PAUSE, REQ_RESET, REQ_QUIT };
@@ -117,7 +124,12 @@ static bool open_stream(struct ao *ao)
                           &IID_IMMDeviceEnumerator, (void **)&enumerator);
     if (FAILED(hr))
         goto fail;
-    hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eRender, eMultimedia, &device);
+    // the device the app's setting names (Dolby Atmos for Headphones is set per output)
+    LPWSTR device_id = wasapi_find_deviceID(ao);
+    if (!device_id)
+        goto fail;
+    hr = IMMDeviceEnumerator_GetDevice(enumerator, device_id, &device);
+    talloc_free(device_id);
     if (FAILED(hr))
         goto fail;
     hr = IMMDevice_Activate(device, &spatial_IID_ISpatialAudioClient, CLSCTX_INPROC_SERVER,
@@ -170,6 +182,18 @@ static bool open_stream(struct ao *ao)
     }
     MP_VERBOSE(ao, "Spatial audio stream: %u dynamic objects\n", (unsigned)p->max_dynamic);
 
+    // The stream's clock (AudioSes' spatial client clock), for the delay; without it, an estimate.
+    if (SUCCEEDED(ISpatialAudioObjectRenderStream_GetService(p->stream, &IID_IAudioClock, (void **)&p->clock)) &&
+        FAILED(IAudioClock_GetFrequency(p->clock, &p->clock_frequency)))
+    {
+        IAudioClock_Release(p->clock);
+        p->clock = NULL;
+    }
+    if (!p->clock || !p->clock_frequency) {
+        MP_VERBOSE(ao, "No stream clock: estimating the delay\n");
+        p->clock_frequency = 0;
+    }
+
     IMMDevice_Release(device);
     IMMDeviceEnumerator_Release(enumerator);
     return true;
@@ -185,6 +209,10 @@ fail:
 static void close_stream(struct priv *p)
 {
     release_objects(p);
+    if (p->clock) {
+        IAudioClock_Release(p->clock);
+        p->clock = NULL;
+    }
     if (p->stream) {
         ISpatialAudioObjectRenderStream_Stop(p->stream);
         ISpatialAudioObjectRenderStream_Release(p->stream);
@@ -202,16 +230,33 @@ static void feed(struct ao *ao)
     struct priv *p = ao->priv;
     UINT32 available = 0, frames = 0;
 
-    if (FAILED(ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(p->stream, &available, &frames)))
+    HRESULT hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(p->stream, &available, &frames);
+    if (FAILED(hr)) {
+        // Spatial sound turned off or changed, or the device gone, invalidates the stream: mpv
+        // reopens the output, on a new stream where spatial audio remains, else another output.
+        if (!p->reloading) {
+            MP_WARN(ao, "Spatial audio stream failed (0x%lx): reopening the output\n", (unsigned long)hr);
+            p->reloading = true;
+            ao_request_reload(ao);
+        }
         return;
+    }
 
     if (frames > p->planes_frames) {
         for (int c = 0; c < ATMOS_CHANNELS; c++)
             p->planes[c] = talloc_realloc(ao, p->planes[c], float, frames);
         p->planes_frames = frames;
     }
-    // the last sample's delay to the ear: this buffer and the one being played
-    int64_t out_time = mp_time_ns() + MP_TIME_S_TO_NS(2.0 * frames / ATMOS_RATE);
+    // When this buffer's last sample plays: what's written and not yet played, by the stream's
+    // clock, plus this buffer; without a clock, this buffer and the one playing.
+    double delay = 2.0 * frames / ATMOS_RATE;
+    UINT64 position = 0;
+    if (p->clock && SUCCEEDED(IAudioClock_GetPosition(p->clock, &position, NULL))) {
+        double queued = (double)p->written / ATMOS_RATE - (double)position / p->clock_frequency;
+        delay = MPMAX(queued, 0) + (double)frames / ATMOS_RATE;
+    }
+    int64_t out_time = mp_time_ns() + MP_TIME_S_TO_NS(delay);
+    p->written += frames;
     ao_read_data(ao, (void **)p->planes, frames, out_time, NULL, true, true);
     if (ao_get_atmos_objects(ao, p->meta, sizeof(p->meta)) != sizeof(p->meta))
         memset(p->meta, 0, sizeof(p->meta)); // silence or a gap: every object idle
@@ -286,6 +331,7 @@ static MP_THREAD_VOID audio_thread(void *arg)
             ISpatialAudioObjectRenderStream_Reset(p->stream);
             release_objects(p);
             p->started = false;
+            p->written = 0; // a reset stream's clock starts again from zero
         }
     }
 

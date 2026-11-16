@@ -248,12 +248,16 @@ static void feed(struct ao *ao)
         p->planes_frames = frames;
     }
     // When this buffer's last sample plays: what's written and not yet played, by the stream's
-    // clock, plus this buffer; without a clock, this buffer and the one playing.
-    double delay = 2.0 * frames / ATMOS_RATE;
+    // clock, plus this buffer; without a clock, this buffer and the one playing. The clock counts
+    // samples handed to the spatial renderer, not heard, so add Dolby Atmos for Headphones' own
+    // processing: its object FIFO (frames mod 256) and its filterbank, hybrid alignment and limiter
+    // (256 + 192 + 64). Windows' endpoint limiter is left out, as plain wasapi leaves it out.
+    double processing = (512.0 + frames % 256) / ATMOS_RATE;
+    double delay = 2.0 * frames / ATMOS_RATE + processing;
     UINT64 position = 0;
     if (p->clock && SUCCEEDED(IAudioClock_GetPosition(p->clock, &position, NULL))) {
         double queued = (double)p->written / ATMOS_RATE - (double)position / p->clock_frequency;
-        delay = MPMAX(queued, 0) + (double)frames / ATMOS_RATE;
+        delay = MPMAX(queued, 0) + (double)frames / ATMOS_RATE + processing;
     }
     int64_t out_time = mp_time_ns() + MP_TIME_S_TO_NS(delay);
     p->written += frames;

@@ -36,6 +36,7 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <spatialaudioclient.h>
+#include <hstring.h>
 
 #include <libavutil/frame.h>
 
@@ -95,6 +96,7 @@ struct priv {
     float *planes[ATMOS_CHANNELS];
     UINT32 planes_frames;
     UINT32 max_dynamic;
+    int renderer;           // RENDERER_*, the device's active spatial format
     bool started;
     bool running;           // the thread is up
     bool reloading;         // the stream failed: mpv reopens the output
@@ -113,6 +115,161 @@ static void release_objects(struct priv *p)
     }
 }
 
+/*
+ * The spatial renderer's processing delay. Windows gives apps no way to read it (the spatial
+ * stream has no latency call and its clock leaves the delay out), so, as Windows' own ASAR does,
+ * it comes from the device's active spatial format (WinRT's
+ * SpatialAudioDeviceConfiguration.ActiveSpatialAudioFormat). Dolby's figure adds the 224-sample
+ * object FIFO that ASAR's 512 leaves out: N mod 256 for N-frame passes.
+ */
+enum {
+    RENDERER_UNKNOWN,
+    RENDERER_SONIC,
+    RENDERER_DOLBY,         // Dolby Atmos for Headphones / for speakers
+    RENDERER_DOLBY_HDMI,    // Dolby Atmos for home theater
+    RENDERER_DTS,           // DTS Headphone:X / DTS:X Ultra
+    RENDERER_DTS_HDMI,      // DTS:X for home theater
+};
+
+static const char *const renderer_names[] = {
+    "unknown", "Windows Sonic", "Dolby Atmos (headphones/speakers)", "Dolby Atmos (home theater)",
+    "DTS (headphones/speakers)", "DTS:X (home theater)",
+};
+
+static double processing_delay(int renderer, UINT32 frames)
+{
+    switch (renderer) {
+    case RENDERER_DOLBY:        return (512.0 + frames % 256) / ATMOS_RATE;
+    case RENDERER_DTS:          return 256.0 / ATMOS_RATE;
+    case RENDERER_DOLBY_HDMI:   return 0.020;
+    case RENDERER_DTS_HDMI:     return 0.010;
+    default:                    return 0; // Windows Sonic: not traced
+    }
+}
+
+// WinRT through combase.dll's exports and the interfaces' vtable slots (mingw has no headers for
+// Windows.Media.Audio): IInspectable's six methods, then each interface's in declaration order.
+typedef HRESULT (WINAPI *RoGetActivationFactoryFn)(HSTRING, REFIID, void **);
+typedef HRESULT (WINAPI *WindowsCreateStringFn)(LPCWSTR, UINT32, HSTRING *);
+typedef HRESULT (WINAPI *WindowsDeleteStringFn)(HSTRING);
+typedef PCWSTR (WINAPI *WindowsGetStringRawBufferFn)(HSTRING, UINT32 *);
+typedef HRESULT (STDMETHODCALLTYPE *GetStringFn)(void *, HSTRING *);
+typedef HRESULT (STDMETHODCALLTYPE *GetForDeviceIdFn)(void *, HSTRING, void **);
+typedef ULONG (STDMETHODCALLTYPE *ReleaseFn)(void *);
+#define WINRT_SLOT(obj, n) ((*(void *const **)(obj))[n])
+#define WINRT_RELEASE(obj) ((ReleaseFn)WINRT_SLOT(obj, 2))(obj)
+
+static const GUID IID_SpatialAudioDeviceConfigurationStatics =
+    {0x3ec37f7b, 0x936d, 0x4e04, {0x97, 0x28, 0x28, 0x27, 0xd9, 0xf7, 0x58, 0xc4}};
+static const GUID IID_SpatialAudioFormatSubtypeStatics =
+    {0xb3de8a47, 0x83ee, 0x4266, {0xa9, 0x45, 0xbe, 0xdf, 0x50, 0x7a, 0xfe, 0xed}};
+static const GUID IID_SpatialAudioFormatSubtypeStatics2 =
+    {0x4565e6cb, 0xd95b, 0x5621, {0xb6, 0xaf, 0x0e, 0x88, 0x49, 0xc5, 0x7c, 0x80}};
+
+struct winrt {
+    RoGetActivationFactoryFn factory;
+    WindowsCreateStringFn create;
+    WindowsDeleteStringFn delete;
+    WindowsGetStringRawBufferFn raw;
+};
+
+static HSTRING winrt_string(struct winrt *w, const wchar_t *s)
+{
+    HSTRING h = NULL;
+    return SUCCEEDED(w->create(s, (UINT32)wcslen(s), &h)) ? h : NULL;
+}
+
+static void *winrt_statics(struct winrt *w, const wchar_t *class, const GUID *iid)
+{
+    HSTRING name = winrt_string(w, class);
+    void *statics = NULL;
+    if (name && FAILED(w->factory(name, iid, &statics)))
+        statics = NULL;
+    w->delete(name);
+    return statics;
+}
+
+// Whether the format subtype at `slot` of `statics` is `format`.
+static bool winrt_is_format(struct winrt *w, void *statics, int slot, HSTRING format)
+{
+    HSTRING subtype = NULL;
+    if (!statics || FAILED(((GetStringFn)WINRT_SLOT(statics, slot))(statics, &subtype)))
+        return false;
+    bool same = wcscmp(w->raw(subtype, NULL), w->raw(format, NULL)) == 0;
+    w->delete(subtype);
+    return same;
+}
+
+// The active spatial format of the endpoint with IMMDevice id `id`.
+static int active_renderer(struct ao *ao, const wchar_t *id)
+{
+    HMODULE combase = GetModuleHandleW(L"combase.dll");
+    if (!combase)
+        combase = LoadLibraryW(L"combase.dll");
+    struct winrt w = {
+        .factory = combase ? (RoGetActivationFactoryFn)(void *)GetProcAddress(combase, "RoGetActivationFactory") : NULL,
+        .create = combase ? (WindowsCreateStringFn)(void *)GetProcAddress(combase, "WindowsCreateString") : NULL,
+        .delete = combase ? (WindowsDeleteStringFn)(void *)GetProcAddress(combase, "WindowsDeleteString") : NULL,
+        .raw = combase ? (WindowsGetStringRawBufferFn)(void *)GetProcAddress(combase, "WindowsGetStringRawBuffer") : NULL,
+    };
+    if (!w.factory || !w.create || !w.delete || !w.raw)
+        return RENDERER_UNKNOWN;
+
+    int renderer = RENDERER_UNKNOWN;
+    void *devices = winrt_statics(&w, L"Windows.Media.Audio.SpatialAudioDeviceConfiguration",
+                                  &IID_SpatialAudioDeviceConfigurationStatics);
+    void *config = NULL;
+    HSTRING format = NULL;
+    if (!devices)
+        goto done;
+    // WinRT names an endpoint by its device interface path; the bare IMMDevice id as a fallback.
+    wchar_t path[512];
+    _snwprintf(path, MP_ARRAY_SIZE(path),
+               L"\\\\?\\SWD#MMDEVAPI#%ls#{e6327cad-dcec-4949-ae8a-991e976a79d2}", id);
+    path[MP_ARRAY_SIZE(path) - 1] = 0;
+    const wchar_t *ids[] = {path, id};
+    for (int i = 0; i < MP_ARRAY_SIZE(ids) && !config; i++) {
+        HSTRING h = winrt_string(&w, ids[i]);
+        if (h && FAILED(((GetForDeviceIdFn)WINRT_SLOT(devices, 6))(devices, h, &config)))
+            config = NULL;
+        w.delete(h);
+    }
+    // ActiveSpatialAudioFormat: after DeviceId, IsSpatialAudioSupported, IsSpatialAudioFormatSupported
+    if (!config || FAILED(((GetStringFn)WINRT_SLOT(config, 9))(config, &format)) || !format)
+        goto done;
+    MP_VERBOSE(ao, "Active spatial format: %ls\n", w.raw(format, NULL));
+
+    void *subtypes = winrt_statics(&w, L"Windows.Media.Audio.SpatialAudioFormatSubtype",
+                                   &IID_SpatialAudioFormatSubtypeStatics);
+    void *subtypes2 = winrt_statics(&w, L"Windows.Media.Audio.SpatialAudioFormatSubtype",
+                                    &IID_SpatialAudioFormatSubtypeStatics2);
+    // WindowsSonic, DolbyAtmosForHeadphones, DolbyAtmosForHomeTheater, DolbyAtmosForSpeakers,
+    // DTSHeadphoneX, DTSXUltra; then (Statics2) DTSXForHomeTheater
+    static const int kinds[] = {RENDERER_SONIC, RENDERER_DOLBY, RENDERER_DOLBY_HDMI,
+                                RENDERER_DOLBY, RENDERER_DTS, RENDERER_DTS};
+    for (int i = 0; i < MP_ARRAY_SIZE(kinds) && renderer == RENDERER_UNKNOWN; i++) {
+        if (winrt_is_format(&w, subtypes, 6 + i, format))
+            renderer = kinds[i];
+    }
+    if (renderer == RENDERER_UNKNOWN && winrt_is_format(&w, subtypes2, 6, format))
+        renderer = RENDERER_DTS_HDMI;
+    if (subtypes)
+        WINRT_RELEASE(subtypes);
+    if (subtypes2)
+        WINRT_RELEASE(subtypes2);
+
+done:
+    if (format)
+        w.delete(format);
+    if (config)
+        WINRT_RELEASE(config);
+    if (devices)
+        WINRT_RELEASE(devices);
+    if (!config)
+        MP_VERBOSE(ao, "Couldn't read the device's active spatial format\n");
+    return renderer;
+}
+
 static bool open_stream(struct ao *ao)
 {
     struct priv *p = ao->priv;
@@ -129,6 +286,9 @@ static bool open_stream(struct ao *ao)
     if (!device_id)
         goto fail;
     hr = IMMDeviceEnumerator_GetDevice(enumerator, device_id, &device);
+    // read on every open: a change of spatial format invalidates the stream and mpv reopens it
+    if (SUCCEEDED(hr))
+        p->renderer = active_renderer(ao, device_id);
     talloc_free(device_id);
     if (FAILED(hr))
         goto fail;
@@ -180,7 +340,8 @@ static bool open_stream(struct ao *ao)
         MP_VERBOSE(ao, "Spatial audio stream refused (0x%lx)\n", (unsigned long)hr);
         goto fail;
     }
-    MP_VERBOSE(ao, "Spatial audio stream: %u dynamic objects\n", (unsigned)p->max_dynamic);
+    MP_VERBOSE(ao, "Spatial audio stream: %u dynamic objects, renderer %s\n",
+               (unsigned)p->max_dynamic, renderer_names[p->renderer]);
 
     // The stream's clock (AudioSes' spatial client clock), for the delay; without it, an estimate.
     if (SUCCEEDED(ISpatialAudioObjectRenderStream_GetService(p->stream, &IID_IAudioClock, (void **)&p->clock)) &&
@@ -249,10 +410,9 @@ static void feed(struct ao *ao)
     }
     // When this buffer's last sample plays: what's written and not yet played, by the stream's
     // clock, plus this buffer; without a clock, this buffer and the one playing. The clock counts
-    // samples handed to the spatial renderer, not heard, so add Dolby Atmos for Headphones' own
-    // processing: its object FIFO (frames mod 256) and its filterbank, hybrid alignment and limiter
-    // (256 + 192 + 64). Windows' endpoint limiter is left out, as plain wasapi leaves it out.
-    double processing = (512.0 + frames % 256) / ATMOS_RATE;
+    // samples handed to the spatial renderer, not heard, so add the renderer's own processing.
+    // Windows' endpoint limiter is left out, as plain wasapi leaves it out.
+    double processing = processing_delay(p->renderer, frames);
     double delay = 2.0 * frames / ATMOS_RATE + processing;
     UINT64 position = 0;
     if (p->clock && SUCCEEDED(IAudioClock_GetPosition(p->clock, &position, NULL))) {

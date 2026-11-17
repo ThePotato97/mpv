@@ -3112,6 +3112,27 @@ static char *asprint_perf(char *res, struct mp_frame_perf *perf)
     return res;
 }
 
+/// What became of the latest frame's Dolby Vision enhancement layer in the VO:
+/// "none", "composed" (rendered with the base layer) or "base-only" (failed to
+/// load, so the base layer alone). Unavailable where the VO doesn't say.
+static int mp_property_video_out_dovi_el(void *ctx, struct m_property *prop,
+                                         int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    int state = MP_DOVI_EL_NONE;
+    if (!mpctx->video_out ||
+        vo_control(mpctx->video_out, VOCTRL_GET_DOVI_EL, &state) <= 0)
+        return M_PROPERTY_UNAVAILABLE;
+    static const char *const names[] = {
+        [MP_DOVI_EL_NONE] = "none",
+        [MP_DOVI_EL_COMPOSED] = "composed",
+        [MP_DOVI_EL_BASE_ONLY] = "base-only",
+    };
+    if (state < 0 || state >= MP_ARRAY_SIZE(names))
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_strdup_ro(action, arg, names[state]);
+}
+
 static int mp_property_vo_passes(void *ctx, struct m_property *prop,
                                  int action, void *arg)
 {
@@ -4847,6 +4868,7 @@ static const struct m_property mp_properties_base[] = {
     {"current-window-scale", mp_property_current_window_scale},
     {"vo-configured", mp_property_vo_configured},
     {"vo-passes", mp_property_vo_passes},
+    {"video-out-dovi-el", mp_property_video_out_dovi_el},
     {"perf-info", mp_property_perf_info},
     {"current-vo", mp_property_vo},
     {"current-gpu-context", mp_property_gpu_context},

@@ -85,6 +85,9 @@ enum mp_voctrl {
 
     VOCTRL_PERFORMANCE_DATA,            // struct voctrl_performance_data*
 
+    // What became of the latest frame's Dolby Vision enhancement layer
+    VOCTRL_GET_DOVI_EL,                 // int* (MP_DOVI_EL_*)
+
     VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
 
     VOCTRL_CONTENT_TYPE,                // enum mp_content_type*
@@ -173,6 +176,12 @@ struct mp_frame_perf {
     int count;
     struct mp_pass_perf perf[VO_PASS_PERF_MAX];
     char desc[VO_PASS_PERF_MAX][VO_PASS_DESC_MAX_LEN];
+};
+
+enum {
+    MP_DOVI_EL_NONE,        // the frame has no enhancement layer
+    MP_DOVI_EL_COMPOSED,    // handed to the renderer with the base layer
+    MP_DOVI_EL_BASE_ONLY,   // it failed to load: the base layer alone
 };
 
 struct voctrl_performance_data {

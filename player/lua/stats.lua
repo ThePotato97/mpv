@@ -885,8 +885,17 @@ local function append_dovi(s, p, track, nlq)
     local profile = track and track["dolby-vision-profile"]
     local first_indent = ""
     if profile then
-        append(s, profile == 7 and (profile .. (nlq and " FEL" or " MEL")) or profile,
-               {prefix="Profile:", nl="", indent=""})
+        local label = profile
+        if profile == 7 and not nlq then
+            label = "7 MEL"
+        elseif profile == 7 then
+            -- What the output did with the FEL: composed onto the base layer,
+            -- or not (failed to load, or never decoded), the base layer alone.
+            local el = mp.get_property("video-out-dovi-el")
+            label = (el == nil or el == "composed") and "7 FEL"
+                    or "7 FEL (base layer only)"
+        end
+        append(s, label, {prefix="Profile:", nl="", indent=""})
         first_indent = indent
     end
     append(s, "v" .. p["dovi-cm"], {prefix="CM:", nl="", indent=first_indent})

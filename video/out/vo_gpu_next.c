@@ -125,6 +125,7 @@ struct priv {
     struct ra_hwdec_ctx hwdec_ctx;
     struct hwdec_slot hwdec;
     struct hwdec_slot el_hwdec;
+    int dovi_el;                // MP_DOVI_EL_*, for the latest frame mapped
     struct timer_pool *sw_upload_timer;
     struct mp_pass_perf sw_upload_perf;
 
@@ -1107,10 +1108,14 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         if (el_ok) {
             pl_frame_set_chroma_location(&fp->el_frame, el_par.chroma_location);
             frame->enhancement_layer = &fp->el_frame;
+            p->dovi_el = MP_DOVI_EL_COMPOSED;
         } else {
             MP_WARN(vo, "Failed setting up enhancement layer; "
                     "rendering base layer only.\n");
+            p->dovi_el = MP_DOVI_EL_BASE_ONLY;
         }
+    } else {
+        p->dovi_el = MP_DOVI_EL_NONE;
     }
 
     if (mpi->film_grain)
@@ -2240,6 +2245,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
         copy_frame_info_to_mp(&p->perf_redraw, &perf->redraw, NULL, NULL);
         return true;
     }
+
+    case VOCTRL_GET_DOVI_EL:
+        *(int *)data = p->dovi_el;
+        return true;
 
     case VOCTRL_SCREENSHOT:
         video_screenshot(vo, data);

@@ -870,7 +870,7 @@ end
 
 -- The frame's Dolby Vision display management metadata (video-params' dovi-* fields, from a
 -- libplacebo with the Dolby Vision DM).
-local function append_dovi(s, p)
+local function append_dovi(s, p, track, nlq)
     if not p or not p["dovi-cm"] then
         return
     end
@@ -881,7 +881,15 @@ local function append_dovi(s, p)
 
     -- Two lines: the levels, then the trims and the rest.
     append(s, "", {prefix="Dolby Vision:"})
-    append(s, "v" .. p["dovi-cm"], {prefix="CM:", nl="", indent=""})
+    -- profile, and for P7 the layer: FEL if the RPU's NLQ carries a residual, else MEL
+    local profile = track and track["dolby-vision-profile"]
+    local first_indent = ""
+    if profile then
+        append(s, profile == 7 and (profile .. (nlq and " FEL" or " MEL")) or profile,
+               {prefix="Profile:", nl="", indent=""})
+        first_indent = indent
+    end
+    append(s, "v" .. p["dovi-cm"], {prefix="CM:", nl="", indent=first_indent})
     append(s, format("%s / %s", nits(p["dovi-source-min"]), nits(p["dovi-source-max"])),
            {prefix="Source:", suffix=" cd/m²", nl="", indent=indent})
     if p["dovi-l1-max"] then
@@ -1119,7 +1127,7 @@ local function add_video(s)
         ro["max-pq-y"], ro["avg-pq-y"] = nil, nil
     end
     append_hdr(s, ro)
-    append_dovi(s, ro or r)
+    append_dovi(s, ro or r, track, (r and r["dovi-nlq"]) or (ro and ro["dovi-nlq"]))
     append_property(s, "video-bitrate", {prefix="Bitrate:"})
     append_filters(s, "vf", "Filters:")
 end

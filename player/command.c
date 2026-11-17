@@ -2663,6 +2663,9 @@ static int property_imgparams(const struct mp_image_params *p, int action, void 
         // content mapping version: CM v4.0 streams carry L254
         {"dovi-cm",         SUB_PROP_STR(dm->l254_version >= 0 ? "4.0" : "2.9"),
                             .unavailable = !dm->present},
+        // the RPU carries non-trivial NLQ, i.e. an FEL residual (false for MEL / non-P7)
+        {"dovi-nlq",        SUB_PROP_BOOL(p->repr.dovi && p->repr.dovi->nlq_active),
+                            .unavailable = !p->repr.dovi},
         {"dovi-source-min", SUB_PROP_FLOAT(DOVI_NITS(dm->source_min_pq)), .unavailable = !dm->present},
         {"dovi-source-max", SUB_PROP_FLOAT(DOVI_NITS(dm->source_max_pq)), .unavailable = !dm->present},
         {"dovi-l1-min",     SUB_PROP_FLOAT(DOVI_NITS(dm->l1_min)), .unavailable = !dm->has_l1},

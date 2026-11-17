@@ -1781,6 +1781,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
     }
+#ifdef PL_HAVE_ENHANCEMENT_LAYER_STATE
+    // The renderer can still drop an enhancement layer handed to it
+    if (p->dovi_el == MP_DOVI_EL_COMPOSED &&
+        pl_renderer_enhancement_layer(p->rr) == PL_ENHANCEMENT_LAYER_FAILED)
+        p->dovi_el = MP_DOVI_EL_BASE_ONLY;
+#endif
 
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
